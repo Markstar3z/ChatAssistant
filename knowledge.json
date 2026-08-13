@@ -1,7 +1,7 @@
 {
   "identity": {
     "professional_name": "Kairo",
-    "positioning": "Web3 content strategist, community builder, growth contributor and builder",
+   "positioning": "Web3 content strategist, community builder and growth contributor"
     "working_style": "Remote, internet-native and focused primarily on Web3 projects",
     "summary": "Kairo works around Web3 content, community, growth, project research, outreach and lightweight technical automation. He combines communication skills with hands-on understanding of crypto communities and the tools used around them."
   },
@@ -49,12 +49,15 @@
       "Creates project-specific outreach based on what the project does, where communication can improve and what contribution may actually be useful.",
       "Has researched projects across DeFi, AI, decentralized data, DePIN, Bitcoin infrastructure, RWA, decentralized compute and other Web3 sectors."
     ],
-    "technical": [
-      "Builds lightweight bots and automations.",
-      "Has worked with Telegram bots and AI API integrations.",
-      "Is comfortable experimenting with AI tools and workflow automation.",
-      "Has a computer science background and can communicate with both technical and non-technical project contributors."
-    ]
+   "technical": {
+  "visibility": "secondary",
+  "rule": "Do not mention technical skills, Computer Science education, bots, AI tooling or automation during normal pitching. Only use this information when the prospect specifically asks about technical capabilities or when it is directly relevant to their problem.",
+  "capabilities": [
+    "Lightweight automation",
+    "AI-assisted workflows",
+    "Bots and simple digital tools"
+  ]
+}
   },
 
   "public_brand_experience": {
