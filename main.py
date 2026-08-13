@@ -10,12 +10,14 @@ load_dotenv()
 
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 AGENTROUTER_API_KEY = os.getenv("AGENTROUTER_API_KEY", "").strip()
-AGENTROUTER_MODEL = os.getenv("AGENTROUTER_MODEL", "gpt-5.6-sol").strip()
+AGENTROUTER_MODEL = os.getenv(
+    "AGENTROUTER_MODEL",
+    "claude-opus-4-8"
+).strip()
 
-# Keep this configurable in Railway in case AgentRouter changes the gateway.
 AGENTROUTER_BASE_URL = os.getenv(
     "AGENTROUTER_BASE_URL",
-    "https://agentrouter.org/v1"
+    "https://agentrouter.org"
 ).rstrip("/")
 
 if not BOT_TOKEN:
@@ -25,16 +27,12 @@ if not AGENTROUTER_API_KEY:
     raise RuntimeError("AGENTROUTER_API_KEY is missing.")
 
 TG_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
-AGENTROUTER_CHAT_URL = f"{AGENTROUTER_BASE_URL}/chat/completions"
+AGENTROUTER_MESSAGES_URL = f"{AGENTROUTER_BASE_URL}/v1/messages"
 
 with open("knowledge.json", "r", encoding="utf-8") as f:
     KNOWLEDGE = json.load(f)
 
-# Conversation memory per Telegram chat.
-# This resets whenever Railway restarts.
 history = defaultdict(lambda: deque(maxlen=16))
-
-# Maps business_connection_id -> Telegram user ID of your Kairo account.
 business_owners = {}
 
 SYSTEM_PROMPT = f"""
@@ -42,25 +40,23 @@ You are Kairo Assistant, an AI assistant helping Kairo manage Web3 conversations
 
 Your role:
 - Reply naturally, briefly, and professionally.
-- Answer questions about Kairo's services using ONLY the knowledge base below.
-- Help understand what a prospect or project needs.
-- Ask useful follow-up questions when appropriate.
-- Keep conversations warm and human, not robotic.
-- Most replies should be concise.
+- Answer questions using ONLY the knowledge base below.
+- Understand what a prospect or project needs.
+- Ask useful follow-up questions.
+- Keep the conversation warm and human.
+- Avoid sounding like a generic customer-support bot.
 
-Important:
+Important boundaries:
 - You are Kairo Assistant, not Kairo himself.
-- Never say Kairo personally read or saw something unless you know that is true.
-- Never invent clients, partnerships, achievements, testimonials, credentials, prices, dates, or availability.
-- Never promise guaranteed growth, token performance, listings, funding, or results.
-- Never agree to final pricing.
+- Never say Kairo personally saw or read a message unless you know he did.
+- Never invent clients, partnerships, achievements, credentials, prices, dates, availability, or testimonials.
+- Never guarantee growth, token performance, funding, listings, or results.
+- Never finalize pricing.
 - Never agree to contracts or binding commitments.
-- Never send or request passwords, seed phrases, private keys, login codes, or sensitive credentials.
 - Never approve payments or wallet transfers.
-- If the conversation reaches final negotiation, payment, contracts, sensitive access,
-  or something that requires Kairo personally, say Kairo will take over from there.
-- Stay focused on Web3, content, community, growth, collaborations, and related work.
-- Do not answer unrelated personal questions as if you were Kairo.
+- Never request passwords, OTPs, private keys, or seed phrases.
+- If the discussion reaches final negotiation, payment, contracts, sensitive access, or a binding decision, say that Kairo will take over personally.
+- Focus primarily on Web3, content, community, growth, collaborations, and related work.
 
 Knowledge base:
 {json.dumps(KNOWLEDGE, ensure_ascii=False, indent=2)}
@@ -91,46 +87,51 @@ async def telegram_call(method: str, payload: dict):
         return data["result"]
 
 
+def convert_history(chat_id: int):
+    result = []
+
+    for msg in history[chat_id]:
+        result.append({
+            "role": msg["role"],
+            "content": msg["content"]
+        })
+
+    return result
+
+
 async def ask_agentrouter(chat_id: int, user_text: str) -> str:
-    messages = [
-        {
-            "role": "system",
-            "content": SYSTEM_PROMPT
-        }
-    ]
+    messages = convert_history(chat_id)
 
-    messages.extend(list(history[chat_id]))
-
-    messages.append(
-        {
-            "role": "user",
-            "content": user_text
-        }
-    )
+    messages.append({
+        "role": "user",
+        "content": user_text
+    })
 
     headers = {
         "Authorization": f"Bearer {AGENTROUTER_API_KEY}",
-        "Content-Type": "application/json"
+        "Content-Type": "application/json",
+        "anthropic-version": "2023-06-01"
     }
 
     payload = {
         "model": AGENTROUTER_MODEL,
-        "messages": messages,
-        "temperature": 0.6,
-        "max_tokens": 450
+        "max_tokens": 400,
+        "system": SYSTEM_PROMPT,
+        "messages": messages
     }
 
     async with httpx.AsyncClient(timeout=90) as client:
         response = await client.post(
-            AGENTROUTER_CHAT_URL,
+            AGENTROUTER_MESSAGES_URL,
             headers=headers,
             json=payload
         )
 
+        print("AgentRouter status:", response.status_code)
+
         if response.status_code >= 400:
             print(
-                "AgentRouter HTTP error:",
-                response.status_code,
+                "AgentRouter error:",
                 response.text
             )
 
@@ -138,21 +139,30 @@ async def ask_agentrouter(chat_id: int, user_text: str) -> str:
 
         data = response.json()
 
-    answer = data["choices"][0]["message"]["content"].strip()
+    content = data.get("content", [])
 
-    history[chat_id].append(
-        {
-            "role": "user",
-            "content": user_text
-        }
-    )
+    answer = ""
 
-    history[chat_id].append(
-        {
-            "role": "assistant",
-            "content": answer
-        }
-    )
+    for block in content:
+        if block.get("type") == "text":
+            answer += block.get("text", "")
+
+    answer = answer.strip()
+
+    if not answer:
+        raise RuntimeError(
+            f"No text returned from AgentRouter: {data}"
+        )
+
+    history[chat_id].append({
+        "role": "user",
+        "content": user_text
+    })
+
+    history[chat_id].append({
+        "role": "assistant",
+        "content": answer
+    })
 
     return answer
 
@@ -169,22 +179,19 @@ def should_ignore_message(message: dict) -> bool:
         return True
 
     sender = message.get("from") or {}
-    sender_id = sender.get("id")
 
-    # Ignore messages sent by bots.
     if sender.get("is_bot"):
         return True
 
-    # Ignore messages sent by your own Kairo business account.
+    sender_id = sender.get("id")
     owner_id = business_owners.get(connection_id)
 
     if owner_id and sender_id == owner_id:
-        print("Ignoring outgoing message from Kairo.")
+        print("Ignoring outgoing Kairo message.")
         return True
 
-    # Telegram may identify messages sent by a connected business bot.
     if message.get("sender_business_bot"):
-        print("Ignoring message sent by business bot.")
+        print("Ignoring business-bot message.")
         return True
 
     return False
@@ -197,17 +204,18 @@ async def handle_business_message(message: dict):
     connection_id = message.get("business_connection_id")
     chat = message.get("chat") or {}
     chat_id = chat.get("id")
-
     text = (message.get("text") or "").strip()
 
     if not connection_id or not chat_id or not text:
         return
 
+    sender = message.get("from") or {}
+
     print(
         "Incoming business message:",
         {
             "chat_id": chat_id,
-            "from": (message.get("from") or {}).get("username"),
+            "from": sender.get("username"),
             "text": text[:120]
         }
     )
@@ -217,7 +225,7 @@ async def handle_business_message(message: dict):
 
     except httpx.HTTPStatusError as error:
         print(
-            "AgentRouter request failed:",
+            "AgentRouter HTTP failure:",
             error.response.status_code,
             error.response.text
         )
@@ -236,10 +244,7 @@ async def handle_business_message(message: dict):
             {
                 "business_connection_id": connection_id,
                 "chat_id": chat_id,
-                "text": answer,
-                "link_preview_options": {
-                    "is_disabled": True
-                }
+                "text": answer
             }
         )
 
@@ -247,13 +252,12 @@ async def handle_business_message(message: dict):
 
     except Exception as error:
         print(
-            "Telegram sendMessage failed:",
+            "Telegram reply failed:",
             repr(error)
         )
 
 
 async def handle_update(update: dict):
-
     if "business_connection" in update:
         connection = update["business_connection"]
 
@@ -282,7 +286,6 @@ async def handle_update(update: dict):
         )
         return
 
-    # Don't reply again when someone simply edits their message.
     if "edited_business_message" in update:
         return
 
@@ -294,7 +297,7 @@ async def poll():
     offset = 0
 
     print("Kairo Secretary bot is running...")
-    print("AI provider: AgentRouter")
+    print("AI provider: AgentRouter / Claude")
     print("Model:", AGENTROUTER_MODEL)
     print("Gateway:", AGENTROUTER_BASE_URL)
 
@@ -316,19 +319,18 @@ async def poll():
 
             for update in updates:
                 offset = update["update_id"] + 1
-
                 await handle_update(update)
 
         except httpx.HTTPError as error:
             print(
-                "Network/API polling error:",
+                "Polling HTTP error:",
                 repr(error)
             )
             await asyncio.sleep(3)
 
         except Exception as error:
             print(
-                "Unexpected polling error:",
+                "Polling error:",
                 repr(error)
             )
             await asyncio.sleep(3)
