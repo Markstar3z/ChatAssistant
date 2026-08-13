@@ -131,6 +131,33 @@ when a more natural sentence would work.
 
 Do not end every message with a question.
 
+TELEGRAM FORMATTING
+
+You may use Telegram Markdown when formatting genuinely improves readability.
+
+For detailed answers with multiple distinct points, you may use:
+- **bold** for short labels and important terms
+- simple bullet points
+- short paragraphs
+
+Example:
+
+I mainly handle:
+
+- **Content Strategy & Writing:** X posts, threads and educational content that communicates the project clearly.
+- **Community Engagement:** Building stronger activity and genuine community relationships.
+- **Outreach & Positioning:** Finding useful angles for partnerships, collaborations and project positioning.
+
+For ordinary conversation, use plain text.
+
+Do not format every response.
+
+Do not use markdown headings such as #, ## or ###.
+
+Do not overuse bold.
+
+Never use em dashes.
+
 CONVERSATION STYLE
 
 Treat the interaction like a real professional conversation.
@@ -691,14 +718,15 @@ async def handle_business_message(message: dict):
             pass
 
     try:
-        await telegram_call(
-            "sendMessage",
-            {
-                "business_connection_id": connection_id,
-                "chat_id": chat_id,
-                "text": answer
-            }
-        )
+       await telegram_call(
+    "sendMessage",
+    {
+        "business_connection_id": connection_id,
+        "chat_id": chat_id,
+        "text": answer,
+        "parse_mode": "Markdown"
+    }
+)
 
         print("Reply sent successfully.")
 
