@@ -9,158 +9,281 @@ from dotenv import load_dotenv
 load_dotenv()
 
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "").strip()
-DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-chat").strip()
+AGENTROUTER_API_KEY = os.getenv("AGENTROUTER_API_KEY", "").strip()
+AGENTROUTER_MODEL = os.getenv("AGENTROUTER_MODEL", "gpt-5.6-sol").strip()
+
+# Keep this configurable in Railway in case AgentRouter changes the gateway.
+AGENTROUTER_BASE_URL = os.getenv(
+    "AGENTROUTER_BASE_URL",
+    "https://agentrouter.org/v1"
+).rstrip("/")
 
 if not BOT_TOKEN:
-    raise RuntimeError("TELEGRAM_BOT_TOKEN is missing from .env")
-if not DEEPSEEK_API_KEY:
-    raise RuntimeError("DEEPSEEK_API_KEY is missing from .env")
+    raise RuntimeError("TELEGRAM_BOT_TOKEN is missing.")
+
+if not AGENTROUTER_API_KEY:
+    raise RuntimeError("AGENTROUTER_API_KEY is missing.")
 
 TG_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
-DEEPSEEK_URL = "https://api.deepseek.com/chat/completions"
+AGENTROUTER_CHAT_URL = f"{AGENTROUTER_BASE_URL}/chat/completions"
 
 with open("knowledge.json", "r", encoding="utf-8") as f:
     KNOWLEDGE = json.load(f)
 
-# Short per-chat memory. This clears on restart.
+# Conversation memory per Telegram chat.
+# This resets whenever Railway restarts.
 history = defaultdict(lambda: deque(maxlen=16))
 
+# Maps business_connection_id -> Telegram user ID of your Kairo account.
+business_owners = {}
+
 SYSTEM_PROMPT = f"""
-You are Kairo Assistant, an AI assistant that replies on behalf of Kairo inside Telegram private chats.
+You are Kairo Assistant, an AI assistant helping Kairo manage Web3 conversations on Telegram.
 
-Your goals:
+Your role:
 - Reply naturally, briefly, and professionally.
-- Help with Web3 outreach conversations.
-- Answer questions using ONLY the information in the knowledge base below.
-- Understand what the other person/project needs.
-- Ask useful follow-up questions when needed.
-- Keep the conversation moving without sounding robotic.
+- Answer questions about Kairo's services using ONLY the knowledge base below.
+- Help understand what a prospect or project needs.
+- Ask useful follow-up questions when appropriate.
+- Keep conversations warm and human, not robotic.
+- Most replies should be concise.
 
-Important boundaries:
-- Never pretend to be Kairo personally.
-- Never claim Kairo has seen a message unless he actually has.
-- Never invent clients, partnerships, achievements, prices, dates, availability, or credentials.
-- Never make binding commitments.
-- Never agree to final pricing, contracts, payments, wallet transfers, seed phrases, or credentials.
-- If a conversation reaches negotiation, payment, legal terms, sensitive access, or anything requiring Kairo personally,
-  say that Kairo will take over from there.
-- Stay focused on Web3/content/community/growth related conversations.
-- Keep most replies under 120 words unless the user clearly needs more detail.
+Important:
+- You are Kairo Assistant, not Kairo himself.
+- Never say Kairo personally read or saw something unless you know that is true.
+- Never invent clients, partnerships, achievements, testimonials, credentials, prices, dates, or availability.
+- Never promise guaranteed growth, token performance, listings, funding, or results.
+- Never agree to final pricing.
+- Never agree to contracts or binding commitments.
+- Never send or request passwords, seed phrases, private keys, login codes, or sensitive credentials.
+- Never approve payments or wallet transfers.
+- If the conversation reaches final negotiation, payment, contracts, sensitive access,
+  or something that requires Kairo personally, say Kairo will take over from there.
+- Stay focused on Web3, content, community, growth, collaborations, and related work.
+- Do not answer unrelated personal questions as if you were Kairo.
 
 Knowledge base:
 {json.dumps(KNOWLEDGE, ensure_ascii=False, indent=2)}
 """.strip()
 
 
-async def tg_call(method: str, payload: dict):
+async def telegram_call(method: str, payload: dict):
     async with httpx.AsyncClient(timeout=45) as client:
-        r = await client.post(f"{TG_API}/{method}", json=payload)
-        r.raise_for_status()
-        data = r.json()
+        response = await client.post(
+            f"{TG_API}/{method}",
+            json=payload
+        )
+
+        if response.status_code >= 400:
+            print(
+                f"Telegram {method} error:",
+                response.status_code,
+                response.text
+            )
+
+        response.raise_for_status()
+
+        data = response.json()
+
         if not data.get("ok"):
             raise RuntimeError(data)
+
         return data["result"]
 
 
-async def deepseek_reply(chat_id: int, user_text: str) -> str:
-    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
-    messages.extend(history[chat_id])
-    messages.append({"role": "user", "content": user_text})
+async def ask_agentrouter(chat_id: int, user_text: str) -> str:
+    messages = [
+        {
+            "role": "system",
+            "content": SYSTEM_PROMPT
+        }
+    ]
+
+    messages.extend(list(history[chat_id]))
+
+    messages.append(
+        {
+            "role": "user",
+            "content": user_text
+        }
+    )
 
     headers = {
-        "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
-        "Content-Type": "application/json",
+        "Authorization": f"Bearer {AGENTROUTER_API_KEY}",
+        "Content-Type": "application/json"
     }
+
     payload = {
-        "model": DEEPSEEK_MODEL,
+        "model": AGENTROUTER_MODEL,
         "messages": messages,
-        "temperature": 0.55,
-        "max_tokens": 450,
+        "temperature": 0.6,
+        "max_tokens": 450
     }
 
-    async with httpx.AsyncClient(timeout=60) as client:
-        r = await client.post(DEEPSEEK_URL, headers=headers, json=payload)
-        r.raise_for_status()
-        data = r.json()
+    async with httpx.AsyncClient(timeout=90) as client:
+        response = await client.post(
+            AGENTROUTER_CHAT_URL,
+            headers=headers,
+            json=payload
+        )
 
-    text = data["choices"][0]["message"]["content"].strip()
+        if response.status_code >= 400:
+            print(
+                "AgentRouter HTTP error:",
+                response.status_code,
+                response.text
+            )
 
-    history[chat_id].append({"role": "user", "content": user_text})
-    history[chat_id].append({"role": "assistant", "content": text})
-    return text
+        response.raise_for_status()
+
+        data = response.json()
+
+    answer = data["choices"][0]["message"]["content"].strip()
+
+    history[chat_id].append(
+        {
+            "role": "user",
+            "content": user_text
+        }
+    )
+
+    history[chat_id].append(
+        {
+            "role": "assistant",
+            "content": answer
+        }
+    )
+
+    return answer
 
 
-def should_ignore_business_message(message: dict) -> bool:
-    """
-    Avoid replying to our own outgoing business messages or unsupported payloads.
-    """
-    if message.get("from", {}).get("is_bot"):
+def should_ignore_message(message: dict) -> bool:
+    connection_id = message.get("business_connection_id")
+
+    if not connection_id:
         return True
 
-    # Telegram business messages can represent messages in chats managed by the bot.
-    # We only respond to text messages from the other human participant.
     text = (message.get("text") or "").strip()
+
     if not text:
+        return True
+
+    sender = message.get("from") or {}
+    sender_id = sender.get("id")
+
+    # Ignore messages sent by bots.
+    if sender.get("is_bot"):
+        return True
+
+    # Ignore messages sent by your own Kairo business account.
+    owner_id = business_owners.get(connection_id)
+
+    if owner_id and sender_id == owner_id:
+        print("Ignoring outgoing message from Kairo.")
+        return True
+
+    # Telegram may identify messages sent by a connected business bot.
+    if message.get("sender_business_bot"):
+        print("Ignoring message sent by business bot.")
         return True
 
     return False
 
 
-async def reply_via_business_connection(message: dict):
-    business_connection_id = message.get("business_connection_id")
+async def handle_business_message(message: dict):
+    if should_ignore_message(message):
+        return
+
+    connection_id = message.get("business_connection_id")
     chat = message.get("chat") or {}
     chat_id = chat.get("id")
+
     text = (message.get("text") or "").strip()
 
-    if not business_connection_id or not chat_id or not text:
+    if not connection_id or not chat_id or not text:
         return
 
-    if should_ignore_business_message(message):
-        return
+    print(
+        "Incoming business message:",
+        {
+            "chat_id": chat_id,
+            "from": (message.get("from") or {}).get("username"),
+            "text": text[:120]
+        }
+    )
 
     try:
-        answer = await deepseek_reply(chat_id, text)
-    except httpx.HTTPStatusError as e:
-        print("DeepSeek HTTP error:", e.response.status_code, e.response.text)
-        answer = "I hit a temporary issue while processing that. Kairo will take over shortly."
-    except Exception as e:
-        print("DeepSeek error:", repr(e))
-        answer = "I hit a temporary issue while processing that. Kairo will take over shortly."
+        answer = await ask_agentrouter(chat_id, text)
 
-    payload = {
-        "business_connection_id": business_connection_id,
-        "chat_id": chat_id,
-        "text": answer,
-        "disable_web_page_preview": True,
-    }
-
-    try:
-        await tg_call("sendMessage", payload)
-    except Exception as e:
-        print("Telegram sendMessage error:", repr(e))
-
-
-async def handle_update(update: dict):
-    if "business_connection" in update:
-        bc = update["business_connection"]
+    except httpx.HTTPStatusError as error:
         print(
-            "Business connection update:",
-            {
-                "id": bc.get("id"),
-                "is_enabled": bc.get("is_enabled"),
-                "user_chat_id": bc.get("user_chat_id"),
-                "rights": bc.get("rights"),
-            },
+            "AgentRouter request failed:",
+            error.response.status_code,
+            error.response.text
         )
         return
 
-    if "business_message" in update:
-        await reply_via_business_connection(update["business_message"])
+    except Exception as error:
+        print(
+            "AgentRouter unexpected error:",
+            repr(error)
+        )
         return
 
+    try:
+        await telegram_call(
+            "sendMessage",
+            {
+                "business_connection_id": connection_id,
+                "chat_id": chat_id,
+                "text": answer,
+                "link_preview_options": {
+                    "is_disabled": True
+                }
+            }
+        )
+
+        print("Reply sent successfully.")
+
+    except Exception as error:
+        print(
+            "Telegram sendMessage failed:",
+            repr(error)
+        )
+
+
+async def handle_update(update: dict):
+
+    if "business_connection" in update:
+        connection = update["business_connection"]
+
+        connection_id = connection.get("id")
+        owner = connection.get("user") or {}
+
+        if connection_id and owner.get("id"):
+            business_owners[connection_id] = owner["id"]
+
+        print(
+            "Business connection update:",
+            {
+                "id": connection_id,
+                "owner_id": owner.get("id"),
+                "username": owner.get("username"),
+                "is_enabled": connection.get("is_enabled"),
+                "rights": connection.get("rights")
+            }
+        )
+
+        return
+
+    if "business_message" in update:
+        await handle_business_message(
+            update["business_message"]
+        )
+        return
+
+    # Don't reply again when someone simply edits their message.
     if "edited_business_message" in update:
-        # We deliberately do not auto-reply to edits to avoid duplicate replies.
         return
 
     if "deleted_business_messages" in update:
@@ -169,11 +292,15 @@ async def handle_update(update: dict):
 
 async def poll():
     offset = 0
+
     print("Kairo Secretary bot is running...")
+    print("AI provider: AgentRouter")
+    print("Model:", AGENTROUTER_MODEL)
+    print("Gateway:", AGENTROUTER_BASE_URL)
 
     while True:
         try:
-            updates = await tg_call(
+            updates = await telegram_call(
                 "getUpdates",
                 {
                     "offset": offset,
@@ -182,20 +309,28 @@ async def poll():
                         "business_connection",
                         "business_message",
                         "edited_business_message",
-                        "deleted_business_messages",
-                    ],
-                },
+                        "deleted_business_messages"
+                    ]
+                }
             )
 
             for update in updates:
                 offset = update["update_id"] + 1
+
                 await handle_update(update)
 
-        except (httpx.HTTPError, RuntimeError) as e:
-            print("Polling error:", repr(e))
+        except httpx.HTTPError as error:
+            print(
+                "Network/API polling error:",
+                repr(error)
+            )
             await asyncio.sleep(3)
-        except Exception as e:
-            print("Unexpected error:", repr(e))
+
+        except Exception as error:
+            print(
+                "Unexpected polling error:",
+                repr(error)
+            )
             await asyncio.sleep(3)
 
 
