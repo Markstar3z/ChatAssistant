@@ -86,6 +86,13 @@ pending_tasks = {}
 # SYSTEM PROMPT
 # =========================================================
 
+STYLE_RULES = """
+Never use dashes of any kind in your responses.
+Do not use hyphens, en dashes, or em dashes.
+Use commas, semicolons, colons, or full stops instead.
+Keep the writing natural and conversational.
+"""
+
 SYSTEM_PROMPT = f"""
 You are the automated assistant operating this Telegram account while the owner is away.
 
@@ -234,7 +241,34 @@ Do not pitch services just because someone said hello.
 KNOWLEDGE BASE:
 
 {json.dumps(KNOWLEDGE, ensure_ascii=False, indent=2)}
+
+STYLE:
+{STYLE_RULES}
 """.strip()
+
+
+# =========================================================
+# STYLE CLEANUP
+# =========================================================
+
+def clean_response(text: str) -> str:
+    """Remove all dash characters from AI responses."""
+    replacements = {
+        "—": ",",   # em dash
+        "–": ",",   # en dash
+        "−": ",",   # minus sign
+        "‐": ",",   # unicode hyphen
+        "-": ",",   # normal hyphen
+    }
+
+    for dash, replacement in replacements.items():
+        text = text.replace(dash, replacement)
+
+    # Clean up spacing left behind by the swap.
+    text = text.replace(" ,", ",")
+    text = text.replace(",,", ",")
+
+    return text.strip()
 
 
 # =========================================================
@@ -629,6 +663,8 @@ async def generate_and_send(
             await typing_task
         except asyncio.CancelledError:
             pass
+
+    answer = clean_response(answer)
 
     await send_answer(
         connection_id,
