@@ -15,6 +15,17 @@ GEMINI_MODEL = os.getenv(
     "gemini-3.5-flash"
 ).strip()
 
+GEMINI_FALLBACK_MODELS = [
+    model.strip()
+    for model in os.getenv(
+        "GEMINI_FALLBACK_MODELS",
+        "gemini-3.6-flash,gemini-3.5-flash-lite,gemini-3.1-flash-lite"
+    ).split(",")
+    if model.strip()
+]
+
+GEMINI_RETRY_DELAYS = [2, 4, 8]
+
 if not BOT_TOKEN:
     raise RuntimeError("TELEGRAM_BOT_TOKEN is missing.")
 
@@ -23,10 +34,7 @@ if not GEMINI_API_KEY:
 
 TG_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
-GEMINI_URL = (
-    "https://generativelanguage.googleapis.com/"
-    f"v1beta/models/{GEMINI_MODEL}:generateContent"
-)
+GEMINI_API_BASE = "https://generativelanguage.googleapis.com/v1beta/models"
 
 with open("knowledge.json", "r", encoding="utf-8") as f:
     KNOWLEDGE = json.load(f)
@@ -526,16 +534,10 @@ async def ask_gemini(chat_id: int, user_text: str) -> str:
                 }
             ]
         },
-
         "contents": contents,
-
         "generationConfig": {
             "temperature": 0.72,
-
-            # Large enough that visible replies don't get cut off.
             "maxOutputTokens": 1800,
-
-            # Telegram replies normally don't require heavy reasoning.
             "thinkingConfig": {
                 "thinkingLevel": "low"
             }
@@ -547,73 +549,145 @@ async def ask_gemini(chat_id: int, user_text: str) -> str:
         "x-goog-api-key": GEMINI_API_KEY
     }
 
+    # Primary first, then unique fallbacks.
+    models_to_try = []
+    for model in [GEMINI_MODEL] + GEMINI_FALLBACK_MODELS:
+        if model and model not in models_to_try:
+            models_to_try.append(model)
+
+    retryable_statuses = {429, 500, 502, 503, 504}
+    last_error = None
+
     async with httpx.AsyncClient(timeout=90) as client:
-        response = await client.post(
-            GEMINI_URL,
-            headers=headers,
-            json=payload
-        )
+        for model in models_to_try:
+            model_url = f"{GEMINI_API_BASE}/{model}:generateContent"
 
-        print("Gemini status:", response.status_code)
+            # Initial attempt + exponential-backoff retries.
+            for attempt in range(len(GEMINI_RETRY_DELAYS) + 1):
+                try:
+                    response = await client.post(
+                        model_url,
+                        headers=headers,
+                        json=payload
+                    )
 
-        if response.status_code >= 400:
-            print(
-                "Gemini error:",
-                response.text
-            )
+                    print(
+                        "Gemini attempt:",
+                        {
+                            "model": model,
+                            "attempt": attempt + 1,
+                            "status": response.status_code
+                        }
+                    )
 
-        response.raise_for_status()
-        data = response.json()
+                    if response.status_code < 400:
+                        data = response.json()
 
-    candidates = data.get("candidates", [])
+                        candidates = data.get("candidates", [])
 
-    if not candidates:
-        raise RuntimeError(
-            f"Gemini returned no candidates: {data}"
-        )
+                        if not candidates:
+                            raise RuntimeError(
+                                f"Gemini returned no candidates with {model}: {data}"
+                            )
 
-    candidate = candidates[0]
+                        candidate = candidates[0]
+                        finish_reason = candidate.get("finishReason")
 
-    finish_reason = candidate.get("finishReason")
+                        print(
+                            "Gemini success:",
+                            {
+                                "model": model,
+                                "finish_reason": finish_reason
+                            }
+                        )
 
-    print(
-        "Gemini finish reason:",
-        finish_reason
+                        parts = (
+                            candidate
+                            .get("content", {})
+                            .get("parts", [])
+                        )
+
+                        answer_parts = []
+
+                        for part in parts:
+                            part_text = part.get("text")
+
+                            if part_text:
+                                answer_parts.append(part_text)
+
+                        answer = "\n".join(answer_parts).strip()
+
+                        if not answer:
+                            raise RuntimeError(
+                                f"Gemini returned no visible text with {model}: {data}"
+                            )
+
+                        history[chat_id].append({
+                            "role": "user",
+                            "content": user_text
+                        })
+
+                        history[chat_id].append({
+                            "role": "assistant",
+                            "content": answer
+                        })
+
+                        return answer
+
+                    last_error = (
+                        f"{model} returned HTTP {response.status_code}: "
+                        f"{response.text[:1200]}"
+                    )
+
+                    if response.status_code not in retryable_statuses:
+                        print(
+                            "Gemini non-retryable error:",
+                            last_error
+                        )
+                        break
+
+                    if attempt < len(GEMINI_RETRY_DELAYS):
+                        delay = GEMINI_RETRY_DELAYS[attempt]
+
+                        print(
+                            f"Gemini temporary error on {model}. "
+                            f"Retrying in {delay}s..."
+                        )
+
+                        await asyncio.sleep(delay)
+                    else:
+                        print(
+                            f"Gemini retries exhausted for {model}. "
+                            "Trying fallback model..."
+                        )
+
+                except (httpx.TimeoutException, httpx.NetworkError) as error:
+                    last_error = f"{model} network error: {repr(error)}"
+
+                    if attempt < len(GEMINI_RETRY_DELAYS):
+                        delay = GEMINI_RETRY_DELAYS[attempt]
+
+                        print(
+                            f"Gemini network error on {model}. "
+                            f"Retrying in {delay}s..."
+                        )
+
+                        await asyncio.sleep(delay)
+                    else:
+                        print(
+                            f"Gemini network retries exhausted for {model}. "
+                            "Trying fallback model..."
+                        )
+
+                except Exception as error:
+                    last_error = f"{model} unexpected error: {repr(error)}"
+                    print("Gemini model failure:", last_error)
+                    break
+
+    raise RuntimeError(
+        "All Gemini models failed. "
+        f"Last error: {last_error}"
     )
-
-    parts = (
-        candidate
-        .get("content", {})
-        .get("parts", [])
-    )
-
-    answer_parts = []
-
-    for part in parts:
-        text = part.get("text")
-
-        if text:
-            answer_parts.append(text)
-
-    answer = "\n".join(answer_parts).strip()
-
-    if not answer:
-        raise RuntimeError(
-            f"Gemini returned no visible text: {data}"
-        )
-
-    history[chat_id].append({
-        "role": "user",
-        "content": user_text
-    })
-
-    history[chat_id].append({
-        "role": "assistant",
-        "content": answer
-    })
-
-    return answer
-
 
 def should_ignore_message(message: dict) -> bool:
     connection_id = message.get(
@@ -707,7 +781,11 @@ async def handle_business_message(message: dict):
             "Gemini unexpected error:",
             repr(error)
         )
-        return
+
+        answer = (
+            "I'm having a temporary connection issue right now. "
+            "Give me a little moment and I'll pick this up again."
+        )
 
     finally:
         typing_task.cancel()
@@ -718,15 +796,34 @@ async def handle_business_message(message: dict):
             pass
 
     try:
-        await telegram_call(
-            "sendMessage",
-            {
-                "business_connection_id": connection_id,
-                "chat_id": chat_id,
-                "text": answer,
-                "parse_mode": "Markdown"
-            }
-        )
+        try:
+            await telegram_call(
+                "sendMessage",
+                {
+                    "business_connection_id": connection_id,
+                    "chat_id": chat_id,
+                    "text": answer,
+                    "parse_mode": "Markdown"
+                }
+            )
+        except httpx.HTTPStatusError as markdown_error:
+            # If Gemini produced Markdown Telegram dislikes, retry as plain text.
+            if markdown_error.response.status_code == 400:
+                print(
+                    "Markdown send failed. Retrying as plain text:",
+                    markdown_error.response.text
+                )
+
+                await telegram_call(
+                    "sendMessage",
+                    {
+                        "business_connection_id": connection_id,
+                        "chat_id": chat_id,
+                        "text": answer
+                    }
+                )
+            else:
+                raise
 
         print("Reply sent successfully.")
 
@@ -735,6 +832,7 @@ async def handle_business_message(message: dict):
             "Telegram reply failed:",
             repr(error)
         )
+
 
 
 async def handle_update(update: dict):
