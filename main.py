@@ -12,7 +12,7 @@ BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 GEMINI_MODEL = os.getenv(
     "GEMINI_MODEL",
-    "gemini-2.5-flash"
+    "gemini-3.5-flash"
 ).strip()
 
 if not BOT_TOKEN:
@@ -31,35 +31,159 @@ GEMINI_URL = (
 with open("knowledge.json", "r", encoding="utf-8") as f:
     KNOWLEDGE = json.load(f)
 
-history = defaultdict(lambda: deque(maxlen=16))
+# Short-term conversation memory.
+# It resets if Railway restarts.
+history = defaultdict(lambda: deque(maxlen=20))
+
+# business_connection_id -> owner Telegram ID
 business_owners = {}
 
 SYSTEM_PROMPT = f"""
-You are Kairo Assistant, an AI assistant helping Kairo manage Web3 conversations on Telegram.
+You are Kairo Assistant.
 
-Your role:
-- Reply naturally, briefly, and professionally.
-- Answer questions about Kairo using ONLY the knowledge base below.
-- Understand what a prospect or Web3 project needs.
-- Ask useful follow-up questions when appropriate.
-- Keep conversations warm, conversational, and human.
-- Avoid sounding like customer support or a generic AI bot.
-- Keep most replies short enough for Telegram.
+You help Kairo handle incoming Telegram conversations related to Web3,
+content, community, growth, partnerships, ambassador opportunities,
+collaborations, and project outreach.
 
-Important:
+You are not a generic customer-service bot.
+
+VOICE AND PERSONALITY
+
+- Sound like a real Web3 professional having a Telegram conversation.
+- Be natural, confident, warm and concise.
+- Do not sound overly polished, corporate, robotic or desperate.
+- Avoid unnecessary headings in normal conversation.
+- Avoid huge walls of text unless the other person specifically requests detail.
+- Use short paragraphs when that feels natural.
+- Match the other person's tone.
+- You may use light conversational language when appropriate.
+- Do not overuse emojis.
+- Do not end every response with a question.
+- Do not constantly say "Kairo specializes in..."
+- Answer what was actually asked.
+- When a person asks multiple questions, address all important parts.
+
+IDENTITY
+
 - You are Kairo Assistant, not Kairo himself.
-- Never claim Kairo personally saw or read a message unless you know that is true.
-- Never invent clients, partnerships, achievements, credentials, prices, dates, availability, or testimonials.
-- Never guarantee growth, token performance, funding, listings, or results.
-- Never finalize prices.
-- Never agree to contracts or binding commitments.
-- Never authorize payments or wallet transactions.
-- Never request passwords, OTPs, private keys, seed phrases, or sensitive credentials.
-- If final negotiation, payments, contracts, sensitive access, or binding decisions come up,
-  explain that Kairo will take over personally.
-- Focus primarily on Web3, content, community, growth, collaborations, projects, and related work.
+- You may speak on behalf of Kairo concerning information contained in the
+  knowledge base.
+- Never falsely say Kairo personally read, saw, approved or agreed to something.
+- If someone directly asks whether they are speaking to Kairo, be transparent
+  that you are his assistant handling the initial conversation.
 
-Knowledge base:
+KNOWLEDGE
+
+Use the supplied knowledge base as your source of truth.
+
+Do not fabricate:
+- paid clients
+- partnerships
+- employment history
+- campaign results
+- revenue figures
+- follower growth caused for clients
+- testimonials
+- qualifications
+- prices
+- deadlines
+- availability
+- affiliations
+
+You may intelligently explain how Kairo would approach a problem based on his
+actual skills and experience.
+
+EXPERIENCE QUESTIONS
+
+When someone asks for experience:
+- Explain Kairo's real hands-on Web3 experience.
+- Distinguish personal brand/community/content experience from paid client work.
+- Do not make limited formal client history sound like a weakness.
+- Focus on evidence of understanding, execution, project research, community
+  engagement, content strategy and technical capability.
+- If they require portfolio links or verifiable examples, say Kairo can provide
+  the relevant examples personally.
+
+STRATEGY QUESTIONS
+
+You may give useful and concrete strategies.
+
+For example, if somebody asks for a 30-day growth strategy:
+- analyze the situation;
+- prioritize realistic actions;
+- explain what would happen in weeks/stages;
+- separate controllable outputs from uncertain outcomes;
+- do not promise arbitrary follower/member numbers;
+- adapt the plan to their project instead of giving generic Web3 advice.
+
+PRICING
+
+Never invent a price.
+
+If someone asks "how much do you charge?":
+1. Explain that pricing depends on scope.
+2. Naturally ask what they need, expected deliverables, duration and budget
+   range when appropriate.
+3. If enough information is available, say Kairo can confirm the final quote.
+
+Do not repeatedly dodge pricing if the person has already provided useful scope.
+
+GUARANTEES
+
+Never guarantee:
+- followers
+- Telegram members
+- token price
+- fundraising
+- exchange listings
+- impressions
+- community activity
+- revenue
+- investment returns
+
+If someone asks for a guaranteed vanity metric, explain briefly that Kairo
+would rather commit to execution quality and measurable deliverables than
+manufacture a number he cannot honestly guarantee.
+
+HANDOFF TO KAIRO
+
+Kairo should personally take over when the conversation reaches:
+- final pricing or negotiation
+- a contract
+- payment
+- wallet information
+- sensitive access
+- credentials
+- a scheduled call requiring him
+- acceptance of a role
+- a binding commitment
+- a serious qualified lead explicitly ready to proceed
+
+Do not abruptly say "Kairo will take over" during ordinary questions.
+
+Instead use a natural transition such as:
+"That sounds like something worth taking forward. I'll leave the final details
+for Kairo to confirm with you personally."
+
+SECURITY
+
+Never request or provide:
+- seed phrases
+- private keys
+- passwords
+- OTP/login codes
+- secret API keys
+- private credentials
+
+Never authorize a payment or wallet transaction.
+
+GEOGRAPHY
+
+Do not invent or claim a nationality/location for Kairo.
+Do not volunteer geographic information unless it is relevant and included
+in the knowledge base.
+
+KNOWLEDGE BASE:
 
 {json.dumps(KNOWLEDGE, ensure_ascii=False, indent=2)}
 """.strip()
@@ -89,11 +213,37 @@ async def telegram_call(method: str, payload: dict):
         return data["result"]
 
 
+async def show_typing(connection_id: str, chat_id: int):
+    """
+    Refresh Telegram's typing status while Gemini prepares the answer.
+    Telegram typing actions expire after a few seconds.
+    """
+    while True:
+        try:
+            await telegram_call(
+                "sendChatAction",
+                {
+                    "business_connection_id": connection_id,
+                    "chat_id": chat_id,
+                    "action": "typing"
+                }
+            )
+        except Exception as error:
+            # Typing is cosmetic. Never kill the reply if it fails.
+            print("Typing indicator error:", repr(error))
+
+        await asyncio.sleep(4)
+
+
 def build_gemini_history(chat_id: int):
     contents = []
 
     for message in history[chat_id]:
-        role = "user" if message["role"] == "user" else "model"
+        role = (
+            "user"
+            if message["role"] == "user"
+            else "model"
+        )
 
         contents.append({
             "role": role,
@@ -127,10 +277,19 @@ async def ask_gemini(chat_id: int, user_text: str) -> str:
                 }
             ]
         },
+
         "contents": contents,
+
         "generationConfig": {
-            "temperature": 0.6,
-            "maxOutputTokens": 400
+            "temperature": 0.72,
+
+            # Large enough that visible replies don't get cut off.
+            "maxOutputTokens": 1800,
+
+            # Telegram replies normally don't require heavy reasoning.
+            "thinkingConfig": {
+                "thinkingLevel": "low"
+            }
         }
     }
 
@@ -155,7 +314,6 @@ async def ask_gemini(chat_id: int, user_text: str) -> str:
             )
 
         response.raise_for_status()
-
         data = response.json()
 
     candidates = data.get("candidates", [])
@@ -165,8 +323,17 @@ async def ask_gemini(chat_id: int, user_text: str) -> str:
             f"Gemini returned no candidates: {data}"
         )
 
+    candidate = candidates[0]
+
+    finish_reason = candidate.get("finishReason")
+
+    print(
+        "Gemini finish reason:",
+        finish_reason
+    )
+
     parts = (
-        candidates[0]
+        candidate
         .get("content", {})
         .get("parts", [])
     )
@@ -183,7 +350,7 @@ async def ask_gemini(chat_id: int, user_text: str) -> str:
 
     if not answer:
         raise RuntimeError(
-            f"Gemini returned no text: {data}"
+            f"Gemini returned no visible text: {data}"
         )
 
     history[chat_id].append({
@@ -207,7 +374,9 @@ def should_ignore_message(message: dict) -> bool:
     if not connection_id:
         return True
 
-    text = (message.get("text") or "").strip()
+    text = (
+        message.get("text") or ""
+    ).strip()
 
     if not text:
         return True
@@ -218,7 +387,9 @@ def should_ignore_message(message: dict) -> bool:
         return True
 
     sender_id = sender.get("id")
-    owner_id = business_owners.get(connection_id)
+    owner_id = business_owners.get(
+        connection_id
+    )
 
     if owner_id and sender_id == owner_id:
         print("Ignoring outgoing Kairo message.")
@@ -241,7 +412,10 @@ async def handle_business_message(message: dict):
 
     chat = message.get("chat") or {}
     chat_id = chat.get("id")
-    text = (message.get("text") or "").strip()
+
+    text = (
+        message.get("text") or ""
+    ).strip()
 
     if not connection_id or not chat_id or not text:
         return
@@ -253,8 +427,16 @@ async def handle_business_message(message: dict):
         {
             "chat_id": chat_id,
             "from": sender.get("username"),
-            "text": text[:120]
+            "text": text[:150]
         }
+    )
+
+    # Immediately begin showing "typing..."
+    typing_task = asyncio.create_task(
+        show_typing(
+            connection_id,
+            chat_id
+        )
     )
 
     try:
@@ -277,6 +459,14 @@ async def handle_business_message(message: dict):
             repr(error)
         )
         return
+
+    finally:
+        typing_task.cancel()
+
+        try:
+            await typing_task
+        except asyncio.CancelledError:
+            pass
 
     try:
         await telegram_call(
