@@ -718,15 +718,15 @@ async def handle_business_message(message: dict):
             pass
 
     try:
-       await telegram_call(
-    "sendMessage",
-    {
-        "business_connection_id": connection_id,
-        "chat_id": chat_id,
-        "text": answer,
-        "parse_mode": "Markdown"
-    }
-)
+        await telegram_call(
+            "sendMessage",
+            {
+                "business_connection_id": connection_id,
+                "chat_id": chat_id,
+                "text": answer,
+                "parse_mode": "Markdown"
+            }
+        )
 
         print("Reply sent successfully.")
 
